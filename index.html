@@ -18,31 +18,91 @@
 
     /* The Square's base styling */
     #square {
+      /* NEW: Flexbox to center the number inside */
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      
+      /* NEW: Text styling for the numbers */
+      color: white;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-weight: 900;
+      user-select: none; /* Prevents text highlighting on rapid clicks */
+      text-shadow: 0 2px 10px rgba(0,0,0,0.3);
+
       width: 100px;
       height: 100px;
       background-color: hsl(0, 100%, 50%); /* Starts red */
       cursor: pointer;
-      border-radius: 8px; /* Optional: Slightly rounded corners look nice */
-      /* The transition makes the server updates look perfectly smooth */
-      transition: width 0.1s ease, height 0.1s ease, background-color 0.1s ease;
+      border-radius: 12px;
+      /* Smooth transitions for regular clicks */
+      transition: width 0.1s cubic-bezier(0.175, 0.885, 0.32, 1.275), 
+                  height 0.1s cubic-bezier(0.175, 0.885, 0.32, 1.275), 
+                  background-color 0.1s ease;
       box-shadow: 0 0 20px rgba(255, 255, 255, 0.1);
     }
     
     #square:active {
-      transform: scale(0.95); /* Little visual feedback when the user clicks */
+      transform: scale(0.95); /* Visual feedback on click */
+    }
+
+    /* NEW: The Dopamine Hit Animation for the Square */
+    .dopamine-burst {
+      animation: explosion 0.6s cubic-bezier(0.25, 1, 0.5, 1) forwards;
+    }
+
+    @keyframes explosion {
+      0% {
+        transform: scale(1);
+        filter: brightness(1);
+        box-shadow: 0 0 20px rgba(255, 255, 255, 0.8);
+      }
+      20% {
+        transform: scale(1.2) rotate(3deg);
+        filter: brightness(2);
+        box-shadow: 0 0 100px #fff, 0 0 150px currentColor;
+      }
+      40% {
+        transform: scale(1.1) rotate(-3deg);
+      }
+      100% {
+        transform: scale(1) rotate(0deg);
+        filter: brightness(1);
+        box-shadow: 0 0 30px rgba(255, 255, 255, 0.2);
+      }
+    }
+
+    /* NEW: Full screen flash overlay */
+    #flash {
+      position: fixed;
+      top: 0; left: 0; width: 100vw; height: 100vh;
+      background-color: white;
+      pointer-events: none; /* Allows clicking right through it */
+      opacity: 0;
+      z-index: 9999;
+    }
+
+    .flash-active {
+      animation: screen-flash 0.4s ease-out;
+    }
+
+    @keyframes screen-flash {
+      0% { opacity: 0.8; }
+      100% { opacity: 0; }
     }
   </style>
 </head>
 <body>
 
-  <div id="square"></div>
+  <div id="flash"></div>
+
+  <div id="square">0</div>
 
   <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-app.js";
     import { getDatabase, ref, onValue, update, increment } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-database.js";
 
-    // --- STEP 1: PASTE YOUR FIREBASE CONFIG HERE ---
-    // You will get this from the Firebase Console when you create a web app
+    // --- STEP 1: YOUR CONFIG (PRESERVED) ---
     const firebaseConfig = {
       apiKey: "AIzaSyB13xmxwn8bnonujU27kE-LMmTEOxELYQc",
       authDomain: "growing-square-test.firebaseapp.com",
@@ -59,37 +119,63 @@
 
     // DOM Elements & Settings
     const squareEl = document.getElementById('square');
+    const flashEl = document.getElementById('flash');
     const BASE_SIZE = 100;
-    const GROWTH_PER_CLICK = 2; // How many pixels it grows per click
+    const GROWTH_PER_CLICK = 2; // Keeps growing infinitely
+
+    // Track local milestones so animations don't re-trigger on page reload
+    let localClickCount = 0;
 
     // --- STEP 2: LISTEN FOR GLOBAL UPDATES ---
-    // This runs automatically whenever ANYONE clicks and changes the database
     onValue(squareRef, (snapshot) => {
-      // If no data exists yet, default to 0 clicks
       const data = snapshot.val() || { clicks: 0 };
       const totalClicks = data.clicks;
 
-      // 1. Calculate and apply new size
+      // 1. Update text inside square
+      squareEl.textContent = totalClicks;
+
+      // 2. Infinite growth logic (Preserved)
       const newSize = BASE_SIZE + (totalClicks * GROWTH_PER_CLICK);
       squareEl.style.width = newSize + 'px';
       squareEl.style.height = newSize + 'px';
 
-      // 2. Calculate and apply new color (shifts hue around the color wheel)
+      // 3. Dynamically scale the font size so it grows nicely with the box
+      squareEl.style.fontSize = Math.max(24, newSize * 0.18) + 'px';
+
+      // 4. Color shifting wheel
       const newHue = totalClicks % 360;
       squareEl.style.backgroundColor = `hsl(${newHue}, 100%, 50%)`;
+
+      // 5. NEW: Trigger dopamine celebration milestones every 100 clicks
+      if (totalClicks > 0 && totalClicks % 100 === 0 && totalClicks !== localClickCount) {
+        triggerDopamineHit();
+      }
+      
+      localClickCount = totalClicks;
     });
+
+    // --- NEW: THE CELEBRATION FUNCTION ---
+    function triggerDopamineHit() {
+      // Trigger full-screen flash
+      flashEl.classList.remove('flash-active');
+      void flashEl.offsetWidth; // JavaScript trick to force CSS restart
+      flashEl.classList.add('flash-active');
+
+      // Trigger violent square pulse/glow
+      squareEl.classList.remove('dopamine-burst');
+      void squareEl.offsetWidth; 
+      squareEl.classList.add('dopamine-burst');
+    }
 
     // --- STEP 3: HANDLE LOCAL CLICKS ---
     let lastClickTime = 0;
     
     squareEl.addEventListener('click', () => {
-      // Mild client-side throttle: Prevent auto-clicker scripts from crashing your database
-      // Max ~20 clicks per second per user
       const now = Date.now();
-      if (now - lastClickTime < 50) return; 
+      if (now - lastClickTime < 50) return; // ~20 clicks max per second per user
       lastClickTime = now;
 
-      // Tell Firebase to securely add 1 to the total clicks
+      // Increment global counter
       update(ref(db), {
         'squareState/clicks': increment(1)
       });
