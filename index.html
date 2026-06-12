@@ -72,7 +72,7 @@
       }
     }
 
-    /* NEW: The Subtle 20-Click Mini Pop (Less Flashy) */
+    /* The Subtle 20-Click Mini Pop (Less Flashy) */
     .subtle-pop {
       animation: mini-pulse 0.3s ease-out forwards;
     }
@@ -141,7 +141,9 @@
     const squareEl = document.getElementById('square');
     const flashEl = document.getElementById('flash');
     const BASE_SIZE = 100;
-    const GROWTH_PER_CLICK = 2; // Keeps growing infinitely
+    
+    // ADJUSTED: Changed from 2 to 0.5 to grow 4x slower!
+    const GROWTH_PER_CLICK = 0.5; 
 
     // Track local milestones so animations don't re-trigger on page reload
     let localClickCount = 0;
@@ -172,7 +174,7 @@
           // Major milestone (100, 200, 300...)
           triggerDopamineHit();
         } else if (totalClicks % 20 === 0) {
-          // NEW: Minor milestone (20, 40, 60, 80, 120...)
+          // Minor milestone (20, 40, 60, 80, 120...)
           triggerSubtleHit();
         }
       }
@@ -182,26 +184,21 @@
 
     // --- MAJOR CELEBRATION (100 CLICKS) ---
     function triggerDopamineHit() {
-      // Clean up past mini-classes so animations don't conflict
       squareEl.classList.remove('subtle-pop');
 
-      // Trigger full-screen flash
       flashEl.classList.remove('flash-active');
-      void flashEl.offsetWidth; // JavaScript trick to force CSS restart
+      void flashEl.offsetWidth; // Force CSS restart
       flashEl.classList.add('flash-active');
 
-      // Trigger violent square pulse/glow
       squareEl.classList.remove('dopamine-burst');
       void squareEl.offsetWidth; 
       squareEl.classList.add('dopamine-burst');
     }
 
-    // --- NEW: MINOR CELEBRATION (20 CLICKS) ---
+    // --- MINOR CELEBRATION (20 CLICKS) ---
     function triggerSubtleHit() {
-      // Clean up past big-classes so animations don't conflict
       squareEl.classList.remove('dopamine-burst');
 
-      // Trigger a gentle popup pulse on the square (No screen flash!)
       squareEl.classList.remove('subtle-pop');
       void squareEl.offsetWidth; 
       squareEl.classList.add('subtle-pop');
