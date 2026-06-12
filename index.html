@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>The Collective Square</title>
+  <style>
+    /* Centers the square and makes the background dark */
+    body {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      margin: 0;
+      background-color: #111;
+      overflow: hidden; /* Prevents scrollbars when the square gets huge */
+    }
+
+    /* The Square's base styling */
+    #square {
+      width: 100px;
+      height: 100px;
+      background-color: hsl(0, 100%, 50%); /* Starts red */
+      cursor: pointer;
+      border-radius: 8px; /* Optional: Slightly rounded corners look nice */
+      /* The transition makes the server updates look perfectly smooth */
+      transition: width 0.1s ease, height 0.1s ease, background-color 0.1s ease;
+      box-shadow: 0 0 20px rgba(255, 255, 255, 0.1);
+    }
+    
+    #square:active {
+      transform: scale(0.95); /* Little visual feedback when the user clicks */
+    }
+  </style>
+</head>
+<body>
+
+  <div id="square"></div>
+
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-app.js";
+    import { getDatabase, ref, onValue, update, increment } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-database.js";
+
+    // --- STEP 1: PASTE YOUR FIREBASE CONFIG HERE ---
+    // You will get this from the Firebase Console when you create a web app
+    const firebaseConfig = {
+      apiKey: "YOUR_API_KEY",
+      authDomain: "YOUR_PROJECT_ID.firebaseapp.com",
+      databaseURL: "https://YOUR_PROJECT_ID-default-rtdb.firebaseio.com",
+      projectId: "YOUR_PROJECT_ID",
+      storageBucket: "YOUR_PROJECT_ID.appspot.com",
+      messagingSenderId: "YOUR_SENDER_ID",
+      appId: "YOUR_APP_ID"
+    };
+
+    // Initialize Firebase
+    const app = initializeApp(firebaseConfig);
+    const db = getDatabase(app);
+    const squareRef = ref(db, 'squareState');
+
+    // DOM Elements & Settings
+    const squareEl = document.getElementById('square');
+    const BASE_SIZE = 100;
+    const GROWTH_PER_CLICK = 2; // How many pixels it grows per click
+
+    // --- STEP 2: LISTEN FOR GLOBAL UPDATES ---
+    // This runs automatically whenever ANYONE clicks and changes the database
+    onValue(squareRef, (snapshot) => {
+      // If no data exists yet, default to 0 clicks
+      const data = snapshot.val() || { clicks: 0 };
+      const totalClicks = data.clicks;
+
+      // 1. Calculate and apply new size
+      const newSize = BASE_SIZE + (totalClicks * GROWTH_PER_CLICK);
+      squareEl.style.width = newSize + 'px';
+      squareEl.style.height = newSize + 'px';
+
+      // 2. Calculate and apply new color (shifts hue around the color wheel)
+      const newHue = totalClicks % 360;
+      squareEl.style.backgroundColor = `hsl(${newHue}, 100%, 50%)`;
+    });
+
+    // --- STEP 3: HANDLE LOCAL CLICKS ---
+    let lastClickTime = 0;
+    
+    squareEl.addEventListener('click', () => {
+      // Mild client-side throttle: Prevent auto-clicker scripts from crashing your database
+      // Max ~20 clicks per second per user
+      const now = Date.now();
+      if (now - lastClickTime < 50) return; 
+      lastClickTime = now;
+
+      // Tell Firebase to securely add 1 to the total clicks
+      update(ref(db), {
+        'squareState/clicks': increment(1)
+      });
+    });
+  </script>
+</body>
+</html>
