@@ -1,222 +1,966 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Give me a CLICK!</title>
-  <style>
-    /* Centers the square and makes the background dark */
-    body {
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      height: 100vh;
-      margin: 0;
-      background-color: #111;
-      overflow: hidden; /* Prevents scrollbars when the square gets huge */
+"""
+EPI Report Converter — Streamlit App
+=====================================
+Tab 1 — Upload EPI .xls file → SQLite .db + AI guide + push to Supabase
+Tab 2 — Pull Packaging data live from shekpi API → same outputs
+
+Run:  streamlit run app.py
+"""
+
+import io
+import os
+import requests
+import sqlite3
+import tempfile
+
+import pandas as pd
+import streamlit as st
+from bs4 import BeautifulSoup
+
+# Supabase is optional — only needed for the push button
+try:
+    from supabase import create_client
+    SUPABASE_AVAILABLE = True
+except ImportError:
+    SUPABASE_AVAILABLE = False
+
+# ── Page config ───────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="EPI Converter",
+    page_icon="🌿",
+    layout="centered",
+    initial_sidebar_state="collapsed",
+)
+
+# ── Load CSS ──────────────────────────────────────────────────────────────────
+def load_css():
+    css_path = os.path.join(os.path.dirname(__file__), "style.css")
+    if os.path.exists(css_path):
+        with open(css_path, encoding="utf-8") as f:
+            st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
+
+load_css()
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+MONTH_COLS   = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+QUARTER_COLS = ["Q1", "Q2", "Q3", "Q4"]
+
+API_URL = "https://shekpi.scg.com/api/BUEnviManagerData/Get"
+API_HEADERS = {
+    "Cache-Control": "no-cache",
+    "APIKeyName":    "APIKEYSHEKPI",
+    "APIKEYSHEKPI":  "b9e25a83-25b2-431d-9fcf-e9fef75db4ec",
+}
+
+# Maps API Source field values -> canonical metric_group names (matching the EPI file)
+SOURCE_TO_METRIC = {
+    "Production":                                              "Production",
+    "Total Energy Consumption":                                "Energy Consumption",
+    "Thermal Consumption":                                     "Thermal Consumption",
+    "Electrical Consumption":                                  "Electrical Consumption",
+    "Alternative Fuel":                                        "Alternative Fuel",
+    "Scope 1":                                                 "GHG Scope1",
+    "Scope 2":                                                 "GHG Scope2",
+    "Total GHG":                                               "Total GHG Emission",
+    "Withdrawal":                                              "Water Withdrawal",
+    "BOD Loading":                                             "BOD Loading",
+    "COD Loading":                                             "COD Loading",
+    "TSS Loading":                                             "TSS Loading",
+    "Total Dust Emission":                                     "Dust Loading",
+    "Total SOx Emission":                                      "SOx Loading",
+    "Total NOx Emission":                                      "NOx Loading",
+    "Waste Process Hazardous Generate Adjust":                 "Hazardous Waste Generate",
+    "Waste Process Non-Hazardous Generate Adjust":             "Non-Hazardous Waste Generate",
+    "Waste Process Non-Hazardous Manage Outside SCG Landfill": "Waste to landfill",
+    "Waste Process Hazardous Manage Outside SCG Dispose":      "Waste to Dispose",
+    "Withdrawal by source : Recycle":                          "Recycle Water",
+}
+
+METRIC_DESCRIPTIONS = {
+    "Production":                   "Production output volume",
+    "Energy Consumption":           "Total energy used",
+    "Thermal Consumption":          "Thermal (heat/fuel-based) energy used",
+    "Electrical Consumption":       "Electricity used",
+    "Alternative Fuel":             "Energy from alternative/renewable fuel sources",
+    "Total GHG Emission":           "Total greenhouse gas emissions (all scopes)",
+    "GHG Scope1":                   "Direct greenhouse gas emissions (Scope 1)",
+    "GHG Scope2":                   "Indirect GHG emissions from purchased energy (Scope 2)",
+    "Water Withdrawal":             "Total water withdrawn for use",
+    "Recycle Water":                "Water that was recycled/reused",
+    "BOD Loading":                  "Biochemical Oxygen Demand discharged (water pollutant)",
+    "COD Loading":                  "Chemical Oxygen Demand discharged (water pollutant)",
+    "TSS Loading":                  "Total Suspended Solids discharged (water pollutant)",
+    "Dust Loading":                 "Dust/particulate emissions",
+    "SOx Loading":                  "Sulfur oxide emissions",
+    "NOx Loading":                  "Nitrogen oxide emissions",
+    "Hazardous Waste Generate":     "Hazardous waste generated",
+    "Non-Hazardous Waste Generate": "Non-hazardous waste generated",
+    "Waste to landfill":            "Waste sent to landfill",
+    "Waste to Dispose":             "Waste sent for disposal (all methods)",
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SHARED HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_db(metrics_df, catalog_df, companies_df) -> bytes:
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        tmp_path = tmp.name
+    conn = sqlite3.connect(tmp_path)
+    metrics_df.to_sql("epi_metrics",        conn, if_exists="replace", index=False)
+    catalog_df.to_sql("epi_metric_catalog", conn, if_exists="replace", index=False)
+    companies_df.to_sql("epi_companies",    conn, if_exists="replace", index=False)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_metrics_lookup "
+        "ON epi_metrics (year, company_factory, metric_group, value_type, month_name)"
+    )
+    conn.commit()
+    conn.close()
+    with open(tmp_path, "rb") as f:
+        db_bytes = f.read()
+    os.unlink(tmp_path)
+    return db_bytes
+
+
+def build_guide(metrics_df, catalog_df, companies_df, year: int, source: str = "EPI file") -> str:
+    metric_groups = sorted(catalog_df["metric_group"].unique())
+    value_types   = sorted(catalog_df["value_type"].unique())
+    companies     = companies_df["company_factory"].tolist()
+
+    lines = [
+        "EPI DATABASE GUIDE (FOR AI ASSISTANTS)",
+        "=" * 60,
+        "",
+        "PURPOSE OF THIS FILE",
+        "-" * 60,
+        f"This file is context for an AI assistant. epi_data.db (SQLite) "
+        f"contains Environmental Performance Indicator (EPI) data extracted "
+        f"from the company's {source}.",
+        "",
+        "WORKFLOW: Paste this guide into Claude or ChatGPT, then ask questions "
+        "in plain English. The AI will write SQL queries for you to run in "
+        "Supabase or any SQL editor. The AI does not see your actual data values.",
+        "",
+        "DATABASE TABLES (SCHEMA)",
+        "-" * 60,
+        "",
+        "1) epi_metrics  -- main data table, one row per data point",
+        "   Columns:",
+        "     year            INTEGER  - report year, e.g. 2026",
+        "     month           INTEGER  - 1-12 for monthly rows, NULL for Q1-Q4/YTD",
+        "     month_name      TEXT     - 'Jan'..'Dec', 'Q1'..'Q4', or 'YTD'",
+        "     company_factory TEXT     - company/factory code, e.g. 'SNP', 'SKIC-BP'",
+        "     metric_group    TEXT     - what is being measured, e.g. 'Energy Consumption'",
+        "     value_type      TEXT     - 'Absolute' | 'Specific' | 'Percent'",
+        "     unit            TEXT     - unit of measurement, e.g. 'GJ', 'kg CO2'",
+        "     plan_target     REAL     - annual planned/target value",
+        "     value           REAL     - actual reported value",
+        "",
+        "   EXAMPLE QUERY:",
+        "     SELECT value FROM epi_metrics",
+        f"     WHERE year={year} AND month_name='Mar' AND company_factory='SNP'",
+        "       AND metric_group='Energy Consumption' AND value_type='Absolute';",
+        "",
+        "2) epi_metric_catalog  -- all metric categories",
+        "   Columns: metric_group, value_type, metric_label",
+        "",
+        "3) epi_companies  -- company/factory codes",
+        "   Columns: company_factory",
+        "",
+        f"DATA IN THIS FILE (Year {year})",
+        "-" * 60,
+        f"Companies/Factories ({len(companies)}):  " + ", ".join(companies),
+        "",
+        f"Metric Groups ({len(metric_groups)}):",
+    ]
+    for m in metric_groups:
+        desc = METRIC_DESCRIPTIONS.get(m, "See EHS/sustainability team for description")
+        lines.append(f"  - {m}: {desc}")
+    lines += [
+        "",
+        f"Value Types: {', '.join(value_types)}",
+        "",
+        "NOTES",
+        "-" * 60,
+        "- Plan/Target is typically set on Specific (intensity) rows only.",
+        "- Months not yet reported show as 0 or NULL.",
+        "- To build a multi-year time series, load multiple years into the same",
+        "  database — the year column distinguishes them.",
+        "",
+        "IMPORT TO SUPABASE / POSTGRES",
+        "-" * 60,
+        "Option A — pgloader:",
+        "  pgloader epi_data.db postgresql://user:pass@host/dbname",
+        "",
+        "Option B — CSV export then COPY:",
+        "  sqlite3 epi_data.db \".mode csv\" \".headers on\" \".output epi_metrics.csv\"",
+        "  \"SELECT * FROM epi_metrics;\"",
+        "  -- In Postgres: \\copy epi_metrics FROM 'epi_metrics.csv' CSV HEADER",
+    ]
+    return "\n".join(lines)
+
+
+def push_to_supabase(metrics_df, catalog_df, companies_df):
+    """
+    Upsert all three dataframes into Supabase.
+    Reads SUPABASE_URL and SUPABASE_KEY from Streamlit secrets.
+    Returns (success: bool, message: str).
+    """
+    if not SUPABASE_AVAILABLE:
+        return False, "supabase-py not installed. Add `supabase` to requirements.txt."
+
+    try:
+        url = st.secrets["SUPABASE_URL"]
+        key = st.secrets["SUPABASE_KEY"]
+    except KeyError:
+        return False, "credentials_missing"
+
+    try:
+        client = create_client(url, key)
+
+        # Delete all existing data first, then insert fresh
+        # This prevents duplicates when pushing the same year again
+        client.table("epi_metrics").delete().neq("year", -1).execute()
+        client.table("epi_metric_catalog").delete().neq("metric_group", "").execute()
+        client.table("epi_companies").delete().neq("company_factory", "").execute()
+
+        def clean(df):
+            df = df.copy()
+            # Convert float columns that should be integers (e.g. month: 1.0 → 1)
+            for col in ["year", "month"]:
+                if col in df.columns:
+                    df[col] = df[col].astype(object).where(df[col].notna(), None)
+                    df[col] = df[col].apply(lambda x: int(x) if x is not None else None)
+            return df.astype(object).where(pd.notnull(df), None).to_dict(orient="records")
+
+        # Insert in batches of 500 to stay under payload limits
+        records = clean(metrics_df)
+        for i in range(0, len(records), 500):
+            client.table("epi_metrics").insert(records[i:i+500]).execute()
+
+        client.table("epi_metric_catalog").insert(clean(catalog_df)).execute()
+        client.table("epi_companies").insert(clean(companies_df)).execute()
+
+        return True, f"Pushed {len(records):,} rows to Supabase successfully."
+
+    except Exception as e:
+        return False, f"Supabase push failed: {e}"
+
+
+def render_results(metrics_df, catalog_df, companies_df, db_bytes, guide_text, key_prefix):
+    """Shared results UI — stats, downloads, Supabase push, preview."""
+    n_companies = len(companies_df)
+    n_metrics   = len(catalog_df["metric_group"].unique())
+    n_rows      = len(metrics_df)
+
+    st.success("Done — data is ready.")
+
+    st.markdown(f"""
+    <div class="status-row">
+      <div class="stat-box">
+        <div class="stat-value">{n_companies}</div>
+        <div class="stat-label">Companies</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-value">{n_metrics}</div>
+        <div class="stat-label">Metric Groups</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-value">{n_rows:,}</div>
+        <div class="stat-label">Data Rows</div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Downloads ─────────────────────────────────────────────────────────
+    st.markdown('<div class="card-label" style="margin-top:1.5rem;">Downloads</div>',
+                unsafe_allow_html=True)
+    col1, col2 = st.columns(2)
+    with col1:
+        st.download_button(
+            label="⬇ epi_data.db",
+            data=db_bytes,
+            file_name="epi_data.db",
+            mime="application/octet-stream",
+            use_container_width=True,
+            key=f"{key_prefix}_dl_db",
+        )
+    with col2:
+        st.download_button(
+            label="⬇ epi_data_guide.txt",
+            data=guide_text.encode("utf-8"),
+            file_name="epi_data_guide.txt",
+            mime="text/plain",
+            use_container_width=True,
+            key=f"{key_prefix}_dl_guide",
+        )
+
+    # ── Supabase push ─────────────────────────────────────────────────────
+    st.markdown('<div class="card-label" style="margin-top:1.25rem;">Push to Shared Database</div>',
+                unsafe_allow_html=True)
+    st.markdown(
+        "<p style='color:#64748b;font-size:0.82rem;margin:0.2rem 0 0.75rem 0;'>"
+        "Pushes data directly to the team's Supabase database — "
+        "no file sharing needed, everyone queries from one place."
+        "</p>",
+        unsafe_allow_html=True,
+    )
+
+    if st.button("☁ Push to Supabase", use_container_width=True, key=f"{key_prefix}_push"):
+        with st.spinner("Pushing to Supabase…"):
+            ok, msg = push_to_supabase(metrics_df, catalog_df, companies_df)
+        if ok:
+            st.success(msg)
+            # Show clickable link to Supabase SQL editor
+            try:
+                supabase_url = st.secrets["SUPABASE_URL"]
+                project_ref  = supabase_url.replace("https://", "").replace(".supabase.co", "")
+                editor_url   = f"https://supabase.com/dashboard/project/{project_ref}/sql/new"
+                st.markdown(
+                    f"<div style='margin-top:0.5rem;'"
+                    f"><a href='{editor_url}' target='_blank' style='"
+                    f"display:inline-block;background:#0f172a;color:#60a5fa;"
+                    f"border:1px solid #1e3a5f;border-radius:7px;"
+                    f"padding:0.45rem 1rem;font-size:0.85rem;text-decoration:none;"
+                    f"font-weight:500;'>🔗 Open Supabase SQL Editor →</a></div>",
+                    unsafe_allow_html=True,
+                )
+            except Exception:
+                pass
+        elif msg == "credentials_missing":
+            st.error("Supabase credentials not found in Streamlit secrets.")
+            st.markdown("""
+            <div style="
+                background:#1a2535;border:1px solid #2d4a6e;
+                border-left:3px solid #3b82f6;border-radius:6px;
+                padding:0.75rem 1rem;font-size:0.8rem;color:#93c5fd;margin-top:0.5rem;
+            ">
+                <strong>One-time setup:</strong><br><br>
+                1. Create a free project at
+                   <a href="https://supabase.com" target="_blank" style="color:#60a5fa;">supabase.com</a><br>
+                2. Settings → API → copy <em>Project URL</em> and <em>anon public</em> key<br>
+                3. Run this SQL in the Supabase SQL editor to create the tables:<br>
+                <pre style="color:#a5f3fc;margin:0.5rem 0;font-size:0.75rem;">
+CREATE TABLE epi_metrics (
+  year INT, month INT, month_name TEXT,
+  company_factory TEXT, metric_group TEXT,
+  value_type TEXT, unit TEXT,
+  plan_target REAL, value REAL
+);
+CREATE TABLE epi_metric_catalog (
+  metric_group TEXT, value_type TEXT, metric_label TEXT
+);
+CREATE TABLE epi_companies (company_factory TEXT);</pre>
+                4. In Streamlit Cloud → your app → Settings → Secrets, add:<br>
+                <pre style="color:#a5f3fc;margin:0.5rem 0;font-size:0.75rem;">
+SUPABASE_URL = "https://xxxx.supabase.co"
+SUPABASE_KEY = "your-anon-key"</pre>
+                5. Redeploy and try again.
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.error(msg)
+
+    # ── Preview ───────────────────────────────────────────────────────────
+    st.markdown("<hr>", unsafe_allow_html=True)
+    st.markdown('<div class="card-label">Data Preview</div>', unsafe_allow_html=True)
+
+    companies_list = ["All"] + sorted(companies_df["company_factory"].tolist())
+    metrics_list   = ["All"] + sorted(catalog_df["metric_group"].unique().tolist())
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        sel_company = st.selectbox("Company / Factory", companies_list,
+                                   key=f"{key_prefix}_sel_company")
+    with col_b:
+        sel_metric = st.selectbox("Metric Group", metrics_list,
+                                  key=f"{key_prefix}_sel_metric")
+
+    preview = metrics_df[metrics_df["month"].notna()].copy()
+    if sel_company != "All":
+        preview = preview[preview["company_factory"] == sel_company]
+    if sel_metric != "All":
+        preview = preview[preview["metric_group"] == sel_metric]
+
+    st.dataframe(
+        preview[["year", "month_name", "company_factory",
+                 "metric_group", "value_type", "unit", "value", "plan_target"]]
+        .head(200),
+        use_container_width=True,
+        hide_index=True,
+    )
+    if len(preview) > 200:
+        st.caption(f"Showing 200 of {len(preview):,} rows. Download the .db for full data.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 1 — FILE UPLOAD PARSER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_table_titles(soup):
+    titles = []
+    for table in soup.find_all("table"):
+        title = None
+        el = table
+        for _ in range(10):
+            el = el.find_previous_sibling()
+            if el is None:
+                break
+            txt = el.get_text(strip=True)
+            if txt:
+                title = txt
+                break
+        titles.append(title or "Unknown metric")
+    return titles
+
+
+def clean_metric_name(title):
+    for suffix in ("Absolute", "Specific", "Percent"):
+        if title.endswith(suffix):
+            return title[: -len(suffix)].strip(), suffix
+    return title, "Absolute"
+
+
+def parse_epi_file(html: str, year: int):
+    soup   = BeautifulSoup(html, "html.parser")
+    titles = get_table_titles(soup)
+
+    tables = None
+    for flavor in ("lxml", "html5lib", "bs4"):
+        try:
+            tables = pd.read_html(io.StringIO(html), flavor=flavor)
+            break
+        except Exception:
+            continue
+    if tables is None:
+        raise RuntimeError("Could not parse HTML tables. Try installing lxml or html5lib.")
+
+    all_rows, catalog_rows = [], []
+
+    for title, df in zip(titles, tables):
+        metric_group, value_type = clean_metric_name(title)
+        catalog_rows.append({
+            "metric_group": metric_group,
+            "value_type":   value_type,
+            "metric_label": title,
+        })
+        df = df.dropna(how="all")
+        for _, row in df.iterrows():
+            company = row.get("Company/Factory")
+            if pd.isna(company):
+                continue
+            unit        = row.get("Unit")
+            plan_target = row.get("Plan/Target")
+
+            for month_idx, month in enumerate(MONTH_COLS, start=1):
+                all_rows.append({
+                    "year": year, "month": month_idx, "month_name": month,
+                    "company_factory": company, "metric_group": metric_group,
+                    "value_type": value_type, "unit": unit,
+                    "plan_target": plan_target, "value": row.get(month),
+                })
+            for q in QUARTER_COLS:
+                all_rows.append({
+                    "year": year, "month": None, "month_name": q,
+                    "company_factory": company, "metric_group": metric_group,
+                    "value_type": value_type, "unit": unit,
+                    "plan_target": plan_target, "value": row.get(q),
+                })
+            all_rows.append({
+                "year": year, "month": None, "month_name": "YTD",
+                "company_factory": company, "metric_group": metric_group,
+                "value_type": value_type, "unit": unit,
+                "plan_target": plan_target, "value": row.get("YTD"),
+            })
+
+    metrics_df   = pd.DataFrame(all_rows)
+    catalog_df   = pd.DataFrame(catalog_rows).drop_duplicates().reset_index(drop=True)
+    companies_df = (
+        metrics_df[["company_factory"]].dropna().drop_duplicates()
+        .sort_values("company_factory").reset_index(drop=True)
+    )
+    return metrics_df, catalog_df, companies_df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 2 — API PULL PARSER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def parse_epi_api(year: int):
+    params = {
+        "StartMonth": 1, "StartYear": year,
+        "EndMonth":  12, "EndYear":   year,
+        "BUID": 4,
+    }
+    r = requests.get(API_URL, headers=API_HEADERS, params=params, timeout=180)
+    r.raise_for_status()
+
+    raw = r.json().get("Data", [])
+    if not raw:
+        raise RuntimeError("API returned no data. Check year or network/VPN.")
+
+    df = pd.DataFrame(raw)
+    df["Date"]       = pd.to_datetime(df["Date"])
+    df["year"]       = df["Date"].dt.year
+    df["month"]      = df["Date"].dt.month
+    df["month_name"] = df["Date"].dt.month.map(
+        {i+1: m for i, m in enumerate(MONTH_COLS)}
+    )
+
+    targets     = df[df["ReferType"] == "Factory Target"].copy()
+    actuals_all = df[df["ReferType"] == "Factory KPI"].copy()
+
+    # Filter to only rows whose Source maps to a known metric
+    actuals = actuals_all[actuals_all["Source"].isin(SOURCE_TO_METRIC)].copy()
+
+    # ── Deduplication ─────────────────────────────────────────────────────────
+    # Some factories report under multiple boundaries (company vs SCG boundary).
+    # This causes duplicate rows per (factory, source, month).
+    # Keep the row with the largest absolute Value — same logic as Sphera converter.
+    actuals["_abs_val"] = actuals["Value"].abs()
+    actuals = (
+        actuals
+        .sort_values("_abs_val", ascending=False)
+        .drop_duplicates(subset=["Factory", "Source", "year", "month"], keep="first")
+        .drop(columns=["_abs_val"])
+        .reset_index(drop=True)
+    )
+
+    # ── Unit conversions ──────────────────────────────────────────────────────
+    # These metrics arrive in kg from API but EPI report stores them in Tonne
+    KG_TO_TONNE = {"Hazardous Waste Generate", "Non-Hazardous Waste Generate",
+                   "Waste to landfill", "Waste to Dispose"}
+
+    def apply_unit_fix(val, canonical_metric, unit):
+        if canonical_metric in KG_TO_TONNE and str(unit).lower() == "kg":
+            return val / 1000.0
+        return val
+
+    # Build plan_target lookup: (factory, canonical_metric) -> value
+    target_lookup = {}
+    for _, row in targets.iterrows():
+        canonical = SOURCE_TO_METRIC.get(row["Source"])
+        if canonical:
+            target_lookup[(row["Factory"], canonical)] = row["Value"]
+
+    def unit_to_vtype(unit):
+        """Derive value_type from unit string — more reliable than Source name."""
+        u = str(unit)
+        if "%" in u:
+            return "Percent"
+        if "/" in u:
+            return "Specific"
+        return "Absolute"
+
+    all_rows, catalog_rows, seen_catalog = [], [], set()
+
+    for _, row in actuals.iterrows():
+        metric_group = SOURCE_TO_METRIC[row["Source"]]
+        value_type   = unit_to_vtype(row["Unit"])
+        unit         = row["Unit"]
+        company      = row["Factory"]
+        plan_target  = target_lookup.get((company, metric_group))
+
+        catalog_key = (metric_group, value_type)
+        if catalog_key not in seen_catalog:
+            catalog_rows.append({
+                "metric_group": metric_group,
+                "value_type":   value_type,
+                "metric_label": f"{metric_group} {value_type}",
+            })
+            seen_catalog.add(catalog_key)
+
+        all_rows.append({
+            "year":            row["year"],
+            "month":           row["month"],
+            "month_name":      row["month_name"],
+            "company_factory": company,
+            "metric_group":    metric_group,
+            "value_type":      value_type,
+            "unit":            unit,
+            "plan_target":     plan_target,
+            "value":           apply_unit_fix(row["Value"], metric_group, row["Unit"]),
+        })
+
+    if not all_rows:
+        raise RuntimeError(
+            "No valid KPI rows found after filtering. "
+            "Check the debug info above to see what Detail2 values came back."
+        )
+
+    metrics_df = pd.DataFrame(all_rows)
+
+    # ── Post-processing: Specific (intensity) rows ────────────────────────────
+    # Specific = metric Absolute / Production Absolute per factory per month
+    SPECIFIC_UNITS = {
+        "Energy Consumption":           "GJ / Tonne",
+        "Thermal Consumption":          "GJ / Tonne",
+        "Electrical Consumption":       "GJ / Tonne",
+        "Alternative Fuel":             "GJ / Tonne",
+        "Total GHG Emission":           "kg CO2 / Tonne",
+        "GHG Scope1":                   "kg CO2 / Tonne",
+        "GHG Scope2":                   "kg CO2 / Tonne",
+        "Water Withdrawal":             "Cu.m. / Tonne",
+        "Recycle Water":                "Cu.m. / Tonne",
+        "BOD Loading":                  "kg BOD / Tonne",
+        "COD Loading":                  "kg COD / Tonne",
+        "TSS Loading":                  "kg TSS / Tonne",
+        "Dust Loading":                 "g / Ton",
+        "SOx Loading":                  "g / Ton",
+        "NOx Loading":                  "g / Ton",
+        "Hazardous Waste Generate":     "kg / Tonne",
+        "Non-Hazardous Waste Generate": "kg / Tonne",
+        "Waste to landfill":            "kg / Tonne",
+        "Waste to Dispose":             "kg / Tonne",
     }
 
-    /* The Square's base styling */
-    #square {
-      /* Flexbox to center the number inside */
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      
-      /* Text styling for the numbers */
-      color: white;
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      font-weight: 900;
-      user-select: none; /* Prevents text highlighting on rapid clicks */
-      text-shadow: 0 2px 10px rgba(0,0,0,0.3);
+    # Production lookup: (company, year, month) -> value
+    prod_abs = metrics_df[
+        (metrics_df["metric_group"] == "Production") &
+        (metrics_df["value_type"]   == "Absolute")
+    ].set_index(["company_factory", "year", "month"])["value"]
 
-      width: 100px;
-      height: 100px;
-      background-color: hsl(0, 100%, 50%); /* Starts red */
-      cursor: pointer;
-      border-radius: 12px;
-      /* Smooth transitions for regular clicks */
-      transition: width 0.1s cubic-bezier(0.175, 0.885, 0.32, 1.275), 
-                  height 0.1s cubic-bezier(0.175, 0.885, 0.32, 1.275), 
-                  background-color 0.1s ease;
-      box-shadow: 0 0 20px rgba(255, 255, 255, 0.1);
-    }
-    
-    #square:active {
-      transform: scale(0.95); /* Visual feedback on click */
-    }
+    specific_rows = []
+    for _, row in metrics_df[
+        (metrics_df["value_type"] == "Absolute") &
+        (metrics_df["month"].notna())
+    ].iterrows():
+        metric = row["metric_group"]
+        if metric == "Production" or metric not in SPECIFIC_UNITS:
+            continue
+        prod_key = (row["company_factory"], row["year"], row["month"])
+        try:
+            prod_val = prod_abs.loc[prod_key]
+            if isinstance(prod_val, pd.Series):
+                prod_val = prod_val.iloc[0]
+        except KeyError:
+            prod_val = None
+        spec_val = (row["value"] / prod_val) if (prod_val and prod_val != 0 and pd.notna(row["value"])) else None
+        specific_rows.append({
+            "year":            row["year"],
+            "month":           row["month"],
+            "month_name":      row["month_name"],
+            "company_factory": row["company_factory"],
+            "metric_group":    metric,
+            "value_type":      "Specific",
+            "unit":            SPECIFIC_UNITS[metric],
+            "plan_target":     target_lookup.get((row["company_factory"], metric)),
+            "value":           spec_val,
+        })
 
-    /* The Major 100-Click Dopamine Burst */
-    .dopamine-burst {
-      animation: explosion 0.6s cubic-bezier(0.25, 1, 0.5, 1) forwards;
-    }
+    # ── Post-processing: Recycle Water Percent ────────────────────────────────
+    mn_map = {i+1: m for i, m in enumerate(MONTH_COLS)}
 
-    @keyframes explosion {
-      0% {
-        transform: scale(1);
-        filter: brightness(1);
-        box-shadow: 0 0 20px rgba(255, 255, 255, 0.8);
-      }
-      20% {
-        transform: scale(1.2) rotate(3deg);
-        filter: brightness(2);
-        box-shadow: 0 0 100px #fff, 0 0 150px currentColor;
-      }
-      40% {
-        transform: scale(1.1) rotate(-3deg);
-      }
-      100% {
-        transform: scale(1) rotate(0deg);
-        filter: brightness(1);
-        box-shadow: 0 0 30px rgba(255, 255, 255, 0.2);
-      }
-    }
+    withdrawal_abs = metrics_df[
+        (metrics_df["metric_group"] == "Water Withdrawal") &
+        (metrics_df["value_type"]   == "Absolute") &
+        (metrics_df["month"].notna())
+    ].set_index(["company_factory", "year", "month"])["value"]
 
-    /* The Subtle 20-Click Mini Pop (Less Flashy) */
-    .subtle-pop {
-      animation: mini-pulse 0.3s ease-out forwards;
-    }
+    recycle_abs = metrics_df[
+        (metrics_df["metric_group"] == "Recycle Water") &
+        (metrics_df["value_type"]   == "Absolute") &
+        (metrics_df["month"].notna())
+    ].set_index(["company_factory", "year", "month"])["value"]
 
-    @keyframes mini-pulse {
-      0% {
-        transform: scale(1);
-        box-shadow: 0 0 20px rgba(255, 255, 255, 0.1);
-      }
-      50% {
-        transform: scale(1.06); /* Slight quick pop outward */
-        box-shadow: 0 0 50px currentColor; /* Quick bright aura of its current color */
-      }
-      100% {
-        transform: scale(1);
-        box-shadow: 0 0 20px rgba(255, 255, 255, 0.1);
-      }
-    }
+    percent_rows = []
+    for idx, recycle_val in recycle_abs.items():
+        try:
+            w_val = withdrawal_abs.loc[idx]
+            if isinstance(w_val, pd.Series):
+                w_val = w_val.iloc[0]
+        except KeyError:
+            w_val = None
+        pct = (recycle_val / w_val * 100) if (w_val and w_val != 0 and pd.notna(recycle_val)) else None
+        company, yr, mo = idx
+        percent_rows.append({
+            "year":            yr,
+            "month":           mo,
+            "month_name":      mn_map.get(int(mo)),
+            "company_factory": company,
+            "metric_group":    "Recycle Water",
+            "value_type":      "Percent",
+            "unit":            "%",
+            "plan_target":     None,
+            "value":           pct,
+        })
 
-    /* Full screen flash overlay for major milestones */
-    #flash {
-      position: fixed;
-      top: 0; left: 0; width: 100vw; height: 100vh;
-      background-color: white;
-      pointer-events: none; /* Allows clicking right through it */
-      opacity: 0;
-      z-index: 9999;
-    }
+    # Combine all rows
+    extra = pd.DataFrame(specific_rows + percent_rows)
+    if not extra.empty:
+        metrics_df = pd.concat([metrics_df, extra], ignore_index=True)
 
-    .flash-active {
-      animation: screen-flash 0.4s ease-out;
-    }
-
-    @keyframes screen-flash {
-      0% { opacity: 0.8; }
-      100% { opacity: 0; }
-    }
-  </style>
-</head>
-<body>
-
-  <div id="flash"></div>
-
-  <div id="square">0</div>
-
-  <script type="module">
-    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-app.js";
-    import { getDatabase, ref, onValue, update, increment } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-database.js";
-
-    // --- STEP 1: YOUR CONFIG (PRESERVED) ---
-    const firebaseConfig = {
-      apiKey: "AIzaSyB13xmxwn8bnonujU27kE-LMmTEOxELYQc",
-      authDomain: "growing-square-test.firebaseapp.com",
-      projectId: "growing-square-test",
-      storageBucket: "growing-square-test.firebasestorage.app",
-      messagingSenderId: "445218377722",
-      appId: "1:445218377722:web:d2dca26354c845f2e6de43"
-    };
-
-    // Initialize Firebase
-    const app = initializeApp(firebaseConfig);
-    const db = getDatabase(app);
-    const squareRef = ref(db, 'squareState');
-
-    // DOM Elements & Settings
-    const squareEl = document.getElementById('square');
-    const flashEl = document.getElementById('flash');
-    const BASE_SIZE = 100;
-    
-    // ADJUSTED: Changed from 2 to 0.5 to grow 4x slower!
-    const GROWTH_PER_CLICK = 0.5; 
-
-    // Track local milestones so animations don't re-trigger on page reload
-    let localClickCount = 0;
-
-    // --- STEP 2: LISTEN FOR GLOBAL UPDATES ---
-    onValue(squareRef, (snapshot) => {
-      const data = snapshot.val() || { clicks: 0 };
-      const totalClicks = data.clicks;
-
-      // 1. Update text inside square
-      squareEl.textContent = totalClicks;
-
-      // 2. Infinite growth logic
-      const newSize = BASE_SIZE + (totalClicks * GROWTH_PER_CLICK);
-      squareEl.style.width = newSize + 'px';
-      squareEl.style.height = newSize + 'px';
-
-      // 3. Dynamically scale the font size so it grows nicely with the box
-      squareEl.style.fontSize = Math.max(24, newSize * 0.18) + 'px';
-
-      // 4. Color shifting wheel
-      const newHue = totalClicks % 360;
-      squareEl.style.backgroundColor = `hsl(${newHue}, 100%, 50%)`;
-
-      // 5. Trigger dopamine celebration milestones
-      if (totalClicks > 0 && totalClicks !== localClickCount) {
-        if (totalClicks % 100 === 0) {
-          // Major milestone (100, 200, 300...)
-          triggerDopamineHit();
-        } else if (totalClicks % 20 === 0) {
-          // Minor milestone (20, 40, 60, 80, 120...)
-          triggerSubtleHit();
-        }
-      }
-      
-      localClickCount = totalClicks;
-    });
-
-    // --- MAJOR CELEBRATION (100 CLICKS) ---
-    function triggerDopamineHit() {
-      squareEl.classList.remove('subtle-pop');
-
-      flashEl.classList.remove('flash-active');
-      void flashEl.offsetWidth; // Force CSS restart
-      flashEl.classList.add('flash-active');
-
-      squareEl.classList.remove('dopamine-burst');
-      void squareEl.offsetWidth; 
-      squareEl.classList.add('dopamine-burst');
+    # ── Post-processing: Subtotal rows (PP, Pulp, GP, CIP, Energy, Others, Packaging) ──
+    SUBTOTAL_GROUPS = {
+        "PP":       ["SKIC-BP", "SKIC-WS", "TCP1", "TCP2", "UPPC", "VKPC", "Fajar", "Dayasa"],
+        "Pulp":     ["PPPC-Pulp", "TPC-BPP", "TPC-WSP", "TPC-Molded Pulp"],
+        "GP":       ["IPP", "PPPC-Paper", "TPC-Paper", "TPC-FEST", "GPVN", "GPPVN"],
+        "CIP":      ["TCCB", "TCKP", "TCNK", "TCPB", "TCPT", "TCRB", "TCS", "TCSB",
+                     "TCSP", "TCKK", "TCRY", "TWN", "OCON", "OCNP", "OCSS", "PPC",
+                     "VCHD", "VCHQ", "VCHC", "PCM", "IPC", "IRP", "IUG", "IUM",
+                     "BBB", "RA", "SOVI-LA", "SOVI-BD", "Starprint"],
+        "Energy":   ["PPPC-Paper", "PPPC-Pulp", "TPC-BPP", "TPC-WSP", "SCG PE",
+                     "SKIC-BP", "SKIC-WS", "TCP1", "TCP2", "UPPC", "VKPC", "Fajar", "Dayasa"],
+        "Others":   ["SFT", "Peute", "CPP", "Prepack-AM", "Prepack-RY", "Prepack-Sin",
+                     "Conimex", "Vexcel Pack", "Batico", "DTLA", "DTPM", "DTBD",
+                     "MATA", "Duy Tan", "Prepack-Sin 2", "Healthcare Supplies",
+                     "Bicappa", "Deltalab", "VEM-TH"],
+        "Packaging": ["SNP", "SCG PE", "TCP1", "TPC-FEST", "TCS", "TPC-Molded Pulp",
+                      "IUM", "TCP2", "Prepack-Sin", "Deltalab", "Peute", "Prepack-Sin 2",
+                      "Bicappa", "Prepack-RY", "Conimex", "SOVI-LA", "SOVI-BD", "TCRB",
+                      "TCSB", "IUG", "RA", "Starprint", "TCNK", "SKIC-BP", "UPPC",
+                      "Dayasa", "VCHC", "PPPC-Paper", "PPPC-Pulp", "VKPC", "Fajar",
+                      "VCHD", "Vexcel Pack", "OCSS", "TCRY", "TCPT", "VEM-TH", "DTBD",
+                      "SKIC-WS", "OCNP", "PPC", "DTLA", "Duy Tan", "DTPM", "MATA",
+                      "TCCB", "OCON", "GPPVN", "TCSP", "Prepack-AM", "GPVN", "TPC-BPP",
+                      "TPC-Paper", "BBB", "VCHQ", "TWN", "TPC-WSP", "TCKP", "TCPB",
+                      "Batico", "IPP", "SFT", "IRP", "IPC", "PCM", "TCKK"],
     }
 
-    // --- MINOR CELEBRATION (20 CLICKS) ---
-    function triggerSubtleHit() {
-      squareEl.classList.remove('dopamine-burst');
+    # Metrics where subtotal = sum of members (Absolute)
+    # Metrics where subtotal = sum(abs numerator) / sum(production) (Specific)
+    # Production subtotal is always sum
+    mn_map2 = {i+1: m for i, m in enumerate(MONTH_COLS)}
+    subtotal_rows = []
 
-      squareEl.classList.remove('subtle-pop');
-      void squareEl.offsetWidth; 
-      squareEl.classList.add('subtle-pop');
-    }
+    # Get all unique (year, month, month_name) combos present in data
+    time_combos = metrics_df[metrics_df["month"].notna()][
+        ["year", "month", "month_name"]
+    ].drop_duplicates().values.tolist()
 
-    // --- STEP 3: HANDLE LOCAL CLICKS ---
-    let lastClickTime = 0;
-    
-    squareEl.addEventListener('click', () => {
-      const now = Date.now();
-      if (now - lastClickTime < 50) return; // ~20 clicks max per second per user
-      lastClickTime = now;
+    for group_name, members in SUBTOTAL_GROUPS.items():
+        for yr, mo, mo_name in time_combos:
+            member_data = metrics_df[
+                (metrics_df["company_factory"].isin(members)) &
+                (metrics_df["year"]  == yr) &
+                (metrics_df["month"] == mo)
+            ]
+            if member_data.empty:
+                continue
 
-      // Increment global counter
-      update(ref(db), {
-        'squareState/clicks': increment(1)
-      });
-    });
-  </script>
-</body>
-</html>
+            # Production sum for this group/time (used as Specific denominator)
+            prod_sum = member_data[
+                (member_data["metric_group"] == "Production") &
+                (member_data["value_type"]   == "Absolute")
+            ]["value"].sum()
+
+            for metric in metrics_df["metric_group"].unique():
+                if metric == "Production" and group_name != "Production":
+                    # Still compute production subtotal
+                    pass
+
+                abs_subset = member_data[
+                    (member_data["metric_group"] == metric) &
+                    (member_data["value_type"]   == "Absolute")
+                ]
+                if abs_subset.empty:
+                    continue
+
+                unit_abs = abs_subset["unit"].iloc[0]
+                abs_sum  = abs_subset["value"].dropna().sum()
+
+                # Absolute subtotal row
+                subtotal_rows.append({
+                    "year":            yr,
+                    "month":           mo,
+                    "month_name":      mo_name,
+                    "company_factory": group_name,
+                    "metric_group":    metric,
+                    "value_type":      "Absolute",
+                    "unit":            unit_abs,
+                    "plan_target":     None,
+                    "value":           abs_sum,
+                })
+
+                # Specific subtotal row (intensity = sum_abs / sum_production)
+                if metric != "Production" and metric in SPECIFIC_UNITS:
+                    spec_val = (abs_sum / prod_sum) if prod_sum and prod_sum != 0 else None
+                    subtotal_rows.append({
+                        "year":            yr,
+                        "month":           mo,
+                        "month_name":      mo_name,
+                        "company_factory": group_name,
+                        "metric_group":    metric,
+                        "value_type":      "Specific",
+                        "unit":            SPECIFIC_UNITS[metric],
+                        "plan_target":     None,
+                        "value":           spec_val,
+                    })
+
+                # Recycle Water Percent subtotal
+                if metric == "Recycle Water":
+                    w_sum = member_data[
+                        (member_data["metric_group"] == "Water Withdrawal") &
+                        (member_data["value_type"]   == "Absolute")
+                    ]["value"].dropna().sum()
+                    pct_val = (abs_sum / w_sum * 100) if w_sum and w_sum != 0 else None
+                    subtotal_rows.append({
+                        "year":            yr,
+                        "month":           mo,
+                        "month_name":      mo_name,
+                        "company_factory": group_name,
+                        "metric_group":    "Recycle Water",
+                        "value_type":      "Percent",
+                        "unit":            "%",
+                        "plan_target":     None,
+                        "value":           pct_val,
+                    })
+
+    if subtotal_rows:
+        metrics_df = pd.concat(
+            [metrics_df, pd.DataFrame(subtotal_rows)],
+            ignore_index=True
+        )
+
+    # Rebuild catalog to include Specific + Percent entries
+    catalog_extra = [
+        {"metric_group": m, "value_type": "Specific", "metric_label": f"{m} Specific"}
+        for m in SPECIFIC_UNITS
+    ] + [{"metric_group": "Recycle Water", "value_type": "Percent", "metric_label": "Recycle Water Percent"}]
+
+    catalog_df = pd.DataFrame(catalog_rows + catalog_extra).drop_duplicates().reset_index(drop=True)
+
+    companies_df = (
+        metrics_df[["company_factory"]].dropna().drop_duplicates()
+        .sort_values("company_factory").reset_index(drop=True)
+    )
+    return metrics_df, catalog_df, companies_df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# APP HEADER
+# ══════════════════════════════════════════════════════════════════════════════
+
+st.markdown("""
+<div class="app-header">
+  <h1>🌿 EPI Report Converter :3</h1>
+  <p>Convert EPI data into a clean SQLite database and AI guide.</p>
+</div>
+""", unsafe_allow_html=True)
+
+tab1, tab2 = st.tabs(["📂  File Upload", "🌐  API Pull (Packaging)"])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 1 UI
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab1:
+    st.markdown("""
+    <div style="margin-bottom:1rem;">
+      <div class="card-label">Full EPI report — all BUs</div>
+      <p style="color:#64748b;font-size:0.85rem;margin:0.25rem 0 1rem 0;">
+        Upload the monthly .xls file downloaded from the EPI website.
+        Works for all business units.
+      </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    uploaded_file = st.file_uploader(
+        "Drop your EPI .xls file here",
+        type=["xls", "xlsx", "html", "htm"],
+        label_visibility="collapsed",
+        key="tab1_upload",
+    )
+
+    year_t1 = st.number_input(
+        "Report Year", min_value=2000, max_value=2100, value=2026, step=1,
+        key="tab1_year",
+    )
+
+    st.markdown('<div style="margin-top:1rem;"></div>', unsafe_allow_html=True)
+
+    if st.button("Convert →", use_container_width=True, key="tab1_convert"):
+        if uploaded_file is None:
+            st.error("Please upload a file first.")
+        else:
+            with st.spinner("Parsing tables…"):
+                try:
+                    html = uploaded_file.read().decode("utf-8", errors="ignore")
+                    metrics_df, catalog_df, companies_df = parse_epi_file(html, int(year_t1))
+                    db_bytes   = build_db(metrics_df, catalog_df, companies_df)
+                    guide_text = build_guide(metrics_df, catalog_df, companies_df,
+                                             int(year_t1), source="EPI monthly report file")
+                    st.session_state["t1_metrics_df"]   = metrics_df
+                    st.session_state["t1_catalog_df"]   = catalog_df
+                    st.session_state["t1_companies_df"] = companies_df
+                    st.session_state["t1_db_bytes"]     = db_bytes
+                    st.session_state["t1_guide_text"]   = guide_text
+                    st.session_state["t1_done"]         = True
+                except Exception as e:
+                    st.error(f"Conversion failed: {e}")
+
+    if st.session_state.get("t1_done"):
+        render_results(
+            st.session_state["t1_metrics_df"],
+            st.session_state["t1_catalog_df"],
+            st.session_state["t1_companies_df"],
+            st.session_state["t1_db_bytes"],
+            st.session_state["t1_guide_text"],
+            key_prefix="t1",
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAB 2 UI
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab2:
+    st.markdown("""
+    <div style="margin-bottom:1rem;">
+      <div class="card-label">Live API pull — all factories</div>
+      <p style="color:#64748b;font-size:0.85rem;margin:0.25rem 0 0 0;">
+        Pulls directly from the shekpi API. No file needed.
+        Returns all 66 factories across all BUs for the selected year.
+      </p>
+      <div style="
+        background:#1a2535;border:1px solid #1e3a2f;
+        border-left:3px solid #22c55e;border-radius:6px;
+        padding:0.6rem 0.9rem;margin-top:0.75rem;
+        font-size:0.82rem;color:#86efac;
+      ">
+        ℹ Note: subtotal rows (PP, Pulp, GP, CIP, Energy, Others, Packaging)
+        are computed by the EPI report and are not present in the API.
+        Use Tab 1 (file upload) if you need those aggregate rows.
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    year_t2 = st.number_input(
+        "Report Year", min_value=2000, max_value=2100, value=2026, step=1,
+        key="tab2_year",
+    )
+
+    st.markdown('<div style="margin-top:1rem;"></div>', unsafe_allow_html=True)
+
+    if st.button("Pull from API →", use_container_width=True, key="tab2_pull"):
+        with st.spinner("Connecting to shekpi API…"):
+            try:
+                metrics_df, catalog_df, companies_df = parse_epi_api(int(year_t2))
+                db_bytes   = build_db(metrics_df, catalog_df, companies_df)
+                guide_text = build_guide(metrics_df, catalog_df, companies_df,
+                                         int(year_t2), source="shekpi API (Packaging BU)")
+                st.session_state["t2_metrics_df"]   = metrics_df
+                st.session_state["t2_catalog_df"]   = catalog_df
+                st.session_state["t2_companies_df"] = companies_df
+                st.session_state["t2_db_bytes"]     = db_bytes
+                st.session_state["t2_guide_text"]   = guide_text
+                st.session_state["t2_done"]         = True
+            except requests.exceptions.ConnectionError:
+                st.error("Could not reach the API. Make sure you are on the company network or VPN.")
+            except requests.exceptions.HTTPError as e:
+                st.error(f"API returned an error: {e}")
+            except Exception as e:
+                st.error(f"Pull failed: {e}")
+
+    if st.session_state.get("t2_done"):
+        render_results(
+            st.session_state["t2_metrics_df"],
+            st.session_state["t2_catalog_df"],
+            st.session_state["t2_companies_df"],
+            st.session_state["t2_db_bytes"],
+            st.session_state["t2_guide_text"],
+            key_prefix="t2",
+        )
